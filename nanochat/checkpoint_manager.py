@@ -1,12 +1,13 @@
 """
-Utilities for saving and loading model/optim/state checkpoints.
+Utilities for saving and loading model/optim/state checkpoints - MLX port.
 """
 import os
 import re
 import glob
 import json
 import logging
-import torch
+import mlx.core as mx
+import mlx.nn as nn
 
 from nanochat.common import get_base_dir
 from nanochat.gpt import GPT, GPTConfig
@@ -23,14 +24,22 @@ def log0(message):
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data):
     assert int(os.environ.get('RANK', 0)) == 0 # prevent footguns for now
     os.makedirs(checkpoint_dir, exist_ok=True)
-    # Save the model state (parameters)
-    model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
-    torch.save(model_data, model_path)
+    # Save the model state (parameters) using MLX's save function
+    model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.npz")
+    mx.savez(model_path, **model_data)
     log0(f"Saved model file to: {model_path}")
     # Save the optimizer state (useful for SFT or any other fine-tuning)
     if optimizer_data is not None:
-        optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}.pt")
-        torch.save(optimizer_data, optimizer_path)
+        optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}.npz")
+        # MLX optimizer states may need special handling
+        if isinstance(optimizer_data, dict):
+            mx.savez(optimizer_path, **optimizer_data)
+        else:
+            # If it's a list, save each optimizer's state separately
+            for i, opt_state in enumerate(optimizer_data):
+                opt_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_{i}.npz")
+                if isinstance(opt_state, dict):
+                    mx.savez(opt_path, **opt_state)
         log0(f"Saved optimizer file to: {optimizer_path}")
     # Save the metadata dict as json
     meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
@@ -40,14 +49,25 @@ def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data)
 
 
 def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False):
-    # Load the model state
-    model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
-    model_data = torch.load(model_path, map_location=device)
+    # Load the model state using MLX's load function
+    model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.npz")
+    model_data = dict(mx.load(model_path))
     # Load the optimizer state if requested
     optimizer_data = None
     if load_optimizer:
-        optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}.pt")
-        optimizer_data = torch.load(optimizer_path, map_location=device)
+        optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}.npz")
+        if os.path.exists(optimizer_path):
+            optimizer_data = dict(mx.load(optimizer_path))
+        else:
+            # Try loading multiple optimizer files
+            optimizer_data = []
+            i = 0
+            while True:
+                opt_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_{i}.npz")
+                if not os.path.exists(opt_path):
+                    break
+                optimizer_data.append(dict(mx.load(opt_path)))
+                i += 1
     # Load the metadata
     meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
     with open(meta_path, "r") as f:
@@ -65,22 +85,22 @@ def build_model(checkpoint_dir, step, device, phase):
     """
     assert phase in ["train", "eval"], f"Invalid phase: {phase}"
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, step, device, load_optimizer=False)
-    # Hack: fix torch compile issue, which prepends all keys with _orig_mod.
+    # Clean up any potential naming issues
     model_data = {k.lstrip("_orig_mod."): v for k, v in model_data.items()}
     model_config_kwargs = meta_data["model_config"]
     log0(f"Building model with config: {model_config_kwargs}")
     model_config = GPTConfig(**model_config_kwargs)
-    with torch.device("meta"):
-        model = GPT(model_config)
-    # Load the model state
-    model.to_empty(device=device)
-    model.init_weights() # note: this is dumb, but we need to init the rotary embeddings. TODO: fix model re-init
-    model.load_state_dict(model_data, strict=True, assign=True)
-    # Put the model in the right training phase / mode
-    if phase == "eval":
-        model.eval()
-    else:
-        model.train()
+
+    # Create the model
+    model = GPT(model_config)
+
+    # Load the model state - MLX uses update() method
+    model.update(model_data)
+
+    # Note: In MLX, there's no explicit train/eval mode switching like PyTorch
+    # We can add a flag if needed, but MLX handles this differently
+    model._phase = phase
+
     # Load the Tokenizer
     tokenizer = get_tokenizer()
     # Sanity check: compatibility between model and tokenizer
@@ -109,8 +129,11 @@ def find_largest_model(checkpoint_dir):
 
 
 def find_last_step(checkpoint_dir):
-    # Look into checkpoint_dir and find model_<step>.pt with the highest step
-    checkpoint_files = glob.glob(os.path.join(checkpoint_dir, "model_*.pt"))
+    # Look into checkpoint_dir and find model_<step>.npz with the highest step
+    checkpoint_files = glob.glob(os.path.join(checkpoint_dir, "model_*.npz"))
+    if not checkpoint_files:
+        # Also try .pt for backwards compatibility with PyTorch checkpoints
+        checkpoint_files = glob.glob(os.path.join(checkpoint_dir, "model_*.pt"))
     if not checkpoint_files:
         raise FileNotFoundError(f"No checkpoints found in {checkpoint_dir}")
     last_step = int(max(os.path.basename(f).split("_")[-1].split(".")[0] for f in checkpoint_files))

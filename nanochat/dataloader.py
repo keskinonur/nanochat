@@ -1,13 +1,14 @@
 from collections import deque
 
-import torch
+import mlx.core as mx
+import numpy as np
 
 from nanochat.common import get_dist_info
 from nanochat.dataset import parquets_iter_batched
 from nanochat.tokenizer import get_tokenizer
 
 def tokenizing_distributed_data_loader(B, T, split, tokenizer_threads=4, tokenizer_batch_size=128):
-    """Stream pretraining text from parquet files, tokenize, yield training batches."""
+    """Stream pretraining text from parquet files, tokenize, yield training batches - MLX port."""
     assert split in ["train", "val"], "split must be 'train' or 'val'"
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
     needed_tokens = B * T + 1 # +1 is because we also need the target at the last token
@@ -16,7 +17,7 @@ def tokenizing_distributed_data_loader(B, T, split, tokenizer_threads=4, tokeniz
     bos_token = tokenizer.get_bos_token_id()
     # scratch buffer holds the tokens for one iteration
     token_buffer = deque() # we stream tokens on the right and pop from the left
-    scratch = torch.empty(needed_tokens, dtype=torch.int64, pin_memory=True)
+    scratch = np.empty(needed_tokens, dtype=np.int64)
 
     # infinite iterator over document batches
     def document_batches():
@@ -40,10 +41,10 @@ def tokenizing_distributed_data_loader(B, T, split, tokenizer_threads=4, tokeniz
         # Move tokens from the deque into the scratch buffer
         for i in range(needed_tokens):
             scratch[i] = token_buffer.popleft()
-        # Create the inputs/targets as 1D tensors
-        inputs_cpu = scratch[:-1].to(dtype=torch.int32)
-        targets_cpu = scratch[1:]
-        # Reshape to 2D and move to GPU async
-        inputs = inputs_cpu.view(B, T).to(device="cuda", dtype=torch.int32, non_blocking=True)
-        targets = targets_cpu.view(B, T).to(device="cuda", dtype=torch.int64, non_blocking=True)
+        # Create the inputs/targets from numpy array
+        inputs_np = scratch[:-1].astype(np.int32)
+        targets_np = scratch[1:].astype(np.int32)
+        # Reshape to 2D and convert to MLX arrays (unified memory - no explicit transfer needed)
+        inputs = mx.array(inputs_np.reshape(B, T))
+        targets = mx.array(targets_np.reshape(B, T))
         yield inputs, targets
