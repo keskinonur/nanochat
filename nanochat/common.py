@@ -1,12 +1,13 @@
 """
 Common utilities for nanochat.
+MLX port - optimized for Apple Silicon.
 """
 
 import os
 import re
 import logging
-import torch
-import torch.distributed as dist
+import mlx.core as mx
+import mlx.nn as nn
 
 class ColoredFormatter(logging.Formatter):
     """Custom formatter that adds colors to log messages."""
@@ -76,55 +77,35 @@ def print_banner():
     print0(banner)
 
 def is_ddp():
-    # TODO is there a proper way
-    return int(os.environ.get('RANK', -1)) != -1
+    # MLX doesn't support distributed training yet
+    # Always return False for single-device training
+    return False
 
 def get_dist_info():
-    if is_ddp():
-        assert all(var in os.environ for var in ['RANK', 'LOCAL_RANK', 'WORLD_SIZE'])
-        ddp_rank = int(os.environ['RANK'])
-        ddp_local_rank = int(os.environ['LOCAL_RANK'])
-        ddp_world_size = int(os.environ['WORLD_SIZE'])
-        return True, ddp_rank, ddp_local_rank, ddp_world_size
-    else:
-        return False, 0, 0, 1
+    # MLX runs on a single device (unified memory model)
+    # Return single device info
+    return False, 0, 0, 1
 
 def compute_init():
-    """Basic initialization that we keep doing over and over, so make common."""
-
-    # CUDA is currently required
-    assert torch.cuda.is_available(), "CUDA is needed for a distributed run atm"
+    """Basic initialization for MLX on Apple Silicon."""
 
     # Reproducibility
-    torch.manual_seed(42)
-    torch.cuda.manual_seed(42)
-    # skipping full reproducibility for now, possibly investigate slowdown later
-    # torch.use_deterministic_algorithms(True)
-    # torch.backends.cudnn.deterministic = True
-    # torch.backends.cudnn.benchmark = False
+    mx.random.seed(42)
 
-    # Precision
-    torch.set_float32_matmul_precision("high") # uses tf32 instead of fp32 for matmuls
-
-    # Distributed setup: Distributed Data Parallel (DDP), optional
+    # MLX uses Metal and unified memory - no explicit device management needed
+    # MLX automatically selects the best device (GPU/CPU)
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
-    if ddp:
-        device = torch.device("cuda", ddp_local_rank)
-        torch.cuda.set_device(device) # make "cuda" default to this device
-        dist.init_process_group(backend="nccl", device_id=device)
-        dist.barrier()
-    else:
-        device = torch.device("cuda")
+    device = mx.default_device()  # Returns the default device
 
-    if ddp_rank == 0:
-        logger.info(f"Distributed world size: {ddp_world_size}")
+    logger.info(f"MLX device: {device}")
+    logger.info(f"Running on Apple Silicon with unified memory")
 
     return ddp, ddp_rank, ddp_local_rank, ddp_world_size, device
 
 def compute_cleanup():
     """Companion function to compute_init, to clean things up before script exit"""
-    if is_ddp():
-        dist.destroy_process_group()
+    # MLX handles cleanup automatically
+    pass
 
 class DummyWandb:
     """Useful if we wish to not use wandb but have all the same signatures"""
