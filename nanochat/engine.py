@@ -17,6 +17,7 @@ from collections import deque
 from nanochat.common import compute_init
 from nanochat.checkpoint_manager import load_model
 
+
 # -----------------------------------------------------------------------------
 # Calculator tool helpers
 @contextmanager
@@ -29,6 +30,7 @@ def timeout(duration, formula):
     yield
     signal.alarm(0)
 
+
 def eval_with_timeout(formula, max_time=3):
     try:
         with timeout(max_time, formula):
@@ -39,6 +41,7 @@ def eval_with_timeout(formula, max_time=3):
         signal.alarm(0)
         return None
 
+
 def use_calculator(expr):
     """Evaluate a math expression safely."""
     expr = expr.replace(",", "")
@@ -47,6 +50,7 @@ def use_calculator(expr):
     if "**" in expr:
         return None
     return eval_with_timeout(expr)
+
 
 # -----------------------------------------------------------------------------
 class KVCache:
@@ -78,7 +82,9 @@ class KVCache:
             if ix in [0, 1, 3, 5]:
                 assert dim1 == dim2, f"Dim mismatch: {dim1} != {dim2}"
             elif ix == 2:
-                assert dim1 == dim2 or dim2 == 1, f"Batch dim mismatch: {dim1} != {dim2}"
+                assert dim1 == dim2 or dim2 == 1, (
+                    f"Batch dim mismatch: {dim1} != {dim2}"
+                )
             elif ix == 4:
                 assert dim1 >= dim2, f"Seq len mismatch: {dim1} < {dim2}"
 
@@ -86,7 +92,9 @@ class KVCache:
         self.kv_cache = mx.zeros(self.kv_shape, dtype=other.kv_cache.dtype)
 
         # 3) copy the data over
-        self.kv_cache[:, :, :, :, :other.pos, :] = other.kv_cache[:, :, :, :, :other.pos, :]
+        self.kv_cache[:, :, :, :, : other.pos, :] = other.kv_cache[
+            :, :, :, :, : other.pos, :
+        ]
 
         # 4) update the pos
         self.pos = other.pos
@@ -108,7 +116,7 @@ class KVCache:
             current_shape[4] = t_needed
             # Create new larger cache and copy
             new_cache = mx.zeros(current_shape, dtype=self.kv_cache.dtype)
-            new_cache[:, :, :, :, :self.kv_cache.shape[4], :] = self.kv_cache
+            new_cache[:, :, :, :, : self.kv_cache.shape[4], :] = self.kv_cache
             self.kv_cache = new_cache
 
         # Insert k, v into the cache
@@ -117,16 +125,12 @@ class KVCache:
         cache_v = self.kv_cache[layer_idx, 1]
 
         # Update the cache slices
-        cache_k = mx.concatenate([
-            cache_k[:, :, :t0, :],
-            k,
-            cache_k[:, :, t1:, :]
-        ], axis=2)
-        cache_v = mx.concatenate([
-            cache_v[:, :, :t0, :],
-            v,
-            cache_v[:, :, t1:, :]
-        ], axis=2)
+        cache_k = mx.concatenate(
+            [cache_k[:, :, :t0, :], k, cache_k[:, :, t1:, :]], axis=2
+        )
+        cache_v = mx.concatenate(
+            [cache_v[:, :, :t0, :], v, cache_v[:, :, t1:, :]], axis=2
+        )
 
         # Update the cache
         kv_layer = mx.stack([cache_k, cache_v], axis=0)
@@ -149,24 +153,57 @@ class KVCache:
 
 # -----------------------------------------------------------------------------
 def sample_next_token(logits, temperature=1.0, top_k=None):
-    """Sample a single next token from given logits of shape (B, vocab_size). Returns (B, 1)."""
+    """Sample a single next token from logits (B, vocab_size). Returns indices (B, 1).
+    Robust to NaN/Inf by falling back to argmax on sanitized logits.
+    """
     assert temperature >= 0.0, "temperature must be non-negative"
 
-    if temperature == 0.0:
-        return mx.argmax(logits, axis=-1, keepdims=True)
+    # Sanitize logits for any NaN/Inf
+    finite = mx.isfinite(logits)
+    neg_large = mx.zeros_like(logits) + (-1e38)
+    logits_sane = mx.where(finite, logits, neg_large)
 
+    if temperature == 0.0:
+        return mx.argmax(logits_sane, axis=-1, keepdims=True)
+
+    vocab = logits.shape[-1]
     if top_k is not None:
-        k = min(top_k, logits.shape[-1])
-        vals, idx = mx.topk(logits, k, axis=-1)
-        vals = vals / temperature
-        probs = mx.softmax(vals, axis=-1)
-        # Sample from top-k
-        choice = mx.random.categorical(mx.log(probs), num_samples=1)
-        return mx.take_along_axis(idx, choice, axis=-1)
+        k = min(max(int(top_k), 0), vocab)
+        if k == 0:
+            top_k = None
+        else:
+            # MLX topk returns values, so explicitly get indices via argsort
+            sorted_idx = mx.argsort(logits_sane, axis=-1)
+            idx = sorted_idx[..., -k:]
+            top_vals = mx.take_along_axis(logits_sane, idx, axis=-1)
+            # Sample within top-k using logits/temperature
+            choice = mx.random.categorical(top_vals / temperature, num_samples=1)
+            # Safety clamp for potential out-of-range indices from categorical
+            choice = mx.minimum(mx.maximum(choice, 0), k - 1)
+            next_ids = mx.take_along_axis(idx, choice, axis=-1)
+            # If any row was completely invalid (all -1e38), fall back to argmax
+            all_bad = mx.all(top_vals == -1e38, axis=-1, keepdims=True)
+            fallback = mx.argmax(logits_sane, axis=-1, keepdims=True)
+            return mx.where(all_bad, fallback, next_ids)
+
+    if top_k is None:
+        next_ids = mx.random.categorical(logits_sane / temperature, num_samples=1)
+        # Safety clamp to ensure valid token ids
+        return mx.minimum(mx.maximum(next_ids, 0), vocab - 1)
     else:
-        logits = logits / temperature
-        probs = mx.softmax(logits, axis=-1)
-        return mx.random.categorical(mx.log(probs), num_samples=1)
+        # MLX topk returns values, so explicitly get indices via argsort
+        sorted_idx = mx.argsort(logits_sane, axis=-1)
+        idx = sorted_idx[..., -k:]
+        top_vals = mx.take_along_axis(logits_sane, idx, axis=-1)
+        # Sample within top-k using logits/temperature
+        choice = mx.random.categorical(top_vals / temperature, num_samples=1)
+        # Safety clamp for potential out-of-range indices from categorical
+        choice = mx.minimum(mx.maximum(choice, 0), k - 1)
+        next_ids = mx.take_along_axis(idx, choice, axis=-1)
+        # If any row was completely invalid (all -1e38), fall back to argmax
+        all_bad = mx.all(top_vals == -1e38, axis=-1, keepdims=True)
+        fallback = mx.argmax(logits_sane, axis=-1, keepdims=True)
+        return mx.where(all_bad, fallback, next_ids)
 
 
 # -----------------------------------------------------------------------------
@@ -181,14 +218,23 @@ class RowState:
 
 
 class Engine:
-
     def __init__(self, model, tokenizer):
         self.model = model
         self.tokenizer = tokenizer
 
-    def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
+    def generate(
+        self,
+        tokens,
+        num_samples=1,
+        max_tokens=None,
+        temperature=1.0,
+        top_k=None,
+        seed=42,
+    ):
         """Generate tokens with KV cache optimization"""
-        assert isinstance(tokens, list) and isinstance(tokens[0], int), "expecting list of ints"
+        assert isinstance(tokens, list) and isinstance(tokens[0], int), (
+            "expecting list of ints"
+        )
         mx.random.seed(seed)
 
         # Get special tokens
@@ -205,7 +251,7 @@ class Engine:
         kv_model_kwargs = {
             "num_heads": m.n_kv_head,
             "head_dim": m.n_embd // m.n_head,
-            "num_layers": m.n_layer
+            "num_layers": m.n_layer,
         }
         kv_cache_prefill = KVCache(
             batch_size=1,
@@ -216,11 +262,25 @@ class Engine:
         ids = mx.array([tokens], dtype=mx.int32)
         logits = self.model(ids, kv_cache=kv_cache_prefill)
         logits = logits[:, -1, :]
+        # Suppress premature end tokens on the first draw
+        vocab = logits.shape[-1]
+        cols = mx.arange(vocab, dtype=mx.int32)
+        suppress_ids = [assistant_end, bos]
+        mask = mx.zeros((vocab,), dtype=mx.int32)
+        for sid in suppress_ids:
+            mask = mx.where(cols == sid, mx.ones_like(mask), mask)
+        mask = mask > 0
+        neg_large = mx.zeros_like(logits) + (-1e38)
+        logits = mx.where(mx.expand_dims(mask, axis=0), neg_large, logits)
         next_ids = sample_next_token(logits, temperature, top_k)
         sampled_tokens = [int(next_ids[0, 0])]
 
         # 2) Replicate the KV cache for each sample/row
-        kv_length_hint = (len(tokens) + max_tokens) if max_tokens is not None else self.model.config.sequence_len
+        kv_length_hint = (
+            (len(tokens) + max_tokens)
+            if max_tokens is not None
+            else self.model.config.sequence_len
+        )
         kv_cache_decode = KVCache(
             batch_size=num_samples,
             seq_len=kv_length_hint,
@@ -231,6 +291,7 @@ class Engine:
 
         # 3) Initialize states for each sample
         row_states = [RowState(tokens.copy()) for _ in range(num_samples)]
+        vocab_size = self.tokenizer.get_vocab_size()
 
         # 4) Main generation loop
         num_generated = 0
@@ -249,6 +310,17 @@ class Engine:
             else:
                 logits = self.model(ids, kv_cache=kv_cache_decode)
                 logits = logits[:, -1, :]
+                # Suppress assistant_end/bos for first token(s) to avoid immediate stop
+                if num_generated < 1:
+                    vocab = logits.shape[-1]
+                    cols = mx.arange(vocab, dtype=mx.int32)
+                    suppress_ids = [assistant_end, bos]
+                    mask = mx.zeros((vocab,), dtype=mx.int32)
+                    for sid in suppress_ids:
+                        mask = mx.where(cols == sid, mx.ones_like(mask), mask)
+                    mask = mask > 0
+                    neg_large = mx.zeros_like(logits) + (-1e38)
+                    logits = mx.where(mx.expand_dims(mask, axis=0), neg_large, logits)
                 next_ids = sample_next_token(logits, temperature, top_k)
                 sampled_tokens = [int(next_ids[i, 0]) for i in range(num_samples)]
 
@@ -258,7 +330,14 @@ class Engine:
             for i, state in enumerate(row_states):
                 is_forced = len(state.forced_tokens) > 0
                 token_masks.append(0 if is_forced else 1)
-                next_token = state.forced_tokens.popleft() if is_forced else sampled_tokens[i]
+                next_token = (
+                    state.forced_tokens.popleft() if is_forced else sampled_tokens[i]
+                )
+                # Clamp to valid vocab range for robustness
+                if next_token < 0:
+                    next_token = 0
+                elif next_token >= vocab_size:
+                    next_token = vocab_size - 1
                 token_column.append(next_token)
 
                 state.current_tokens.append(next_token)
@@ -318,6 +397,7 @@ if __name__ == "__main__":
     Quick inline test to verify the Engine works correctly.
     """
     import time
+
     # init compute
     ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init()
     # load the model and tokenizer
@@ -326,7 +406,9 @@ if __name__ == "__main__":
     # common hyperparameters
     kwargs = dict(max_tokens=64, temperature=0.0)
     # set the starting prompt
-    prompt_tokens = tokenizer.encode("The chemical formula of water is", prepend=bos_token_id)
+    prompt_tokens = tokenizer.encode(
+        "The chemical formula of water is", prepend=bos_token_id
+    )
     # generate the reference sequence
     generated_tokens = []
     t0 = time.time()

@@ -24,6 +24,9 @@ def print0(s="",**kwargs):
         print(s, **kwargs)
 
 for arg in sys.argv[1:]:
+    # common pattern: a bare "--" separator; ignore it
+    if arg == "--":
+        continue
     if '=' not in arg:
         # assume it's the name of a config file
         assert not arg.startswith('--')

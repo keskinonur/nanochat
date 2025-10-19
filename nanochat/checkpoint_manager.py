@@ -83,6 +83,8 @@ def build_model(checkpoint_dir, step, device, phase):
     - tokenizer
     - meta data saved during base model training
     """
+    from mlx.utils import tree_flatten, tree_unflatten
+
     assert phase in ["train", "eval"], f"Invalid phase: {phase}"
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, step, device, load_optimizer=False)
     # Clean up any potential naming issues
@@ -94,8 +96,14 @@ def build_model(checkpoint_dir, step, device, phase):
     # Create the model
     model = GPT(model_config)
 
-    # Load the model state - MLX uses update() method
-    model.update(model_data)
+    # Load the model state - MLX requires special handling for tree structure
+    # Direct update with flat dict doesn't work, so we reconstruct the tree
+    flat_model = dict(tree_flatten(model.parameters()))
+    for key in flat_model.keys():
+        if key in model_data:
+            flat_model[key] = model_data[key]
+    new_tree = tree_unflatten(list(flat_model.items()))
+    model.update(new_tree)
 
     # Note: In MLX, there's no explicit train/eval mode switching like PyTorch
     # We can add a flag if needed, but MLX handles this differently

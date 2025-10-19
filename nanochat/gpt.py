@@ -135,7 +135,7 @@ class CausalSelfAttention(nn.Module):
 
         # Apply causal mask
         mask = mx.tril(mx.ones((Tq, Tk)))
-        mask = mx.where(mask == 0, float('-inf'), 0.0)
+        mask = mx.where(mask == 0, float("-inf"), 0.0)
         scores = scores + mask
 
         # Softmax and weighted sum
@@ -156,16 +156,19 @@ class CausalSelfAttention(nn.Module):
         D = q.shape[-1]
         scores = (q @ mx.transpose(k, (0, 1, 3, 2))) / math.sqrt(D)
 
-        # Create attention mask
+        # Create attention mask without in-place assignment (MLX functional)
         prefix_len = Tk - Tq
-        mask = mx.zeros((Tq, Tk))
+        # Allowed prefix (no masking): zeros
         if prefix_len > 0:
-            mask[:, :prefix_len] = 0.0  # Can attend to prefix
+            prefix_mask = mx.zeros((Tq, prefix_len))
+        else:
+            prefix_mask = mx.zeros((Tq, 0))
         # Causal mask within the chunk
         causal_mask = mx.tril(mx.ones((Tq, Tq)))
-        mask[:, prefix_len:] = mx.where(causal_mask == 0, float('-inf'), 0.0)
+        causal_mask = mx.where(causal_mask == 0, float("-inf"), 0.0)
+        mask = mx.concatenate([prefix_mask, causal_mask], axis=-1)
 
-        scores = scores + mask
+        scores = scores + mask  # broadcast over (B, H)
         attn = mx.softmax(scores, axis=-1)
         y = attn @ v
         return y
@@ -202,7 +205,10 @@ class GPT(nn.Module):
         self.config = config
 
         self.wte = nn.Embedding(config.vocab_size, config.n_embd)
-        self.h = [Block(config, layer_idx) for layer_idx in range(config.n_layer)]
+        # Use nn.Sequential or dict for proper parameter registration
+        self.h = nn.Sequential(
+            *[Block(config, layer_idx) for layer_idx in range(config.n_layer)]
+        )
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
         # Rotary embeddings
@@ -213,29 +219,49 @@ class GPT(nn.Module):
         self.sin = sin
 
     def init_weights(self):
-        """Initialize weights using custom scheme"""
-        # Will be called after model creation
-        def _init_weights(module):
-            if isinstance(module, nn.Linear):
-                fan_out = module.weight.shape[0]
-                fan_in = module.weight.shape[1]
-                std = 1.0 / math.sqrt(fan_in) * min(1.0, math.sqrt(fan_out / fan_in))
-                module.weight = mx.random.normal(module.weight.shape, scale=std)
-            elif isinstance(module, nn.Embedding):
-                module.weight = mx.random.normal(module.weight.shape, scale=1.0)
+        """Initialize weights using custom scheme - MLX style"""
 
-        # Apply to all modules
-        self.apply(_init_weights)
+        # Helper to initialize a Linear layer
+        def init_linear(weight):
+            fan_out, fan_in = weight.shape
+            std = 1.0 / math.sqrt(fan_in) * min(1.0, math.sqrt(fan_out / fan_in))
+            return mx.random.normal(weight.shape, scale=std)
 
-        # Zero out specific weights
-        self.lm_head.weight = mx.zeros_like(self.lm_head.weight)
-        for block in self.h:
-            block.mlp.c_proj.weight = mx.zeros_like(block.mlp.c_proj.weight)
-            block.attn.c_proj.weight = mx.zeros_like(block.attn.c_proj.weight)
+        # Helper to initialize an Embedding layer
+        def init_embedding(weight):
+            return mx.random.normal(weight.shape, scale=1.0)
+
+        # Build update dict matching MLX's nested structure
+        updates = {
+            "wte": {"weight": init_embedding(self.wte.weight)},
+            "h": {"layers": []},
+            "lm_head": {"weight": mx.zeros_like(self.lm_head.weight)},
+        }
+
+        # Initialize all transformer blocks
+        for i, block in enumerate(self.h.layers):
+            layer_updates = {
+                "attn": {
+                    "c_q": {"weight": init_linear(block.attn.c_q.weight)},
+                    "c_k": {"weight": init_linear(block.attn.c_k.weight)},
+                    "c_v": {"weight": init_linear(block.attn.c_v.weight)},
+                    "c_proj": {"weight": mx.zeros_like(block.attn.c_proj.weight)},
+                },
+                "mlp": {
+                    "c_fc": {"weight": init_linear(block.mlp.c_fc.weight)},
+                    "c_proj": {"weight": mx.zeros_like(block.mlp.c_proj.weight)},
+                },
+            }
+            updates["h"]["layers"].append(layer_updates)
+
+        # Apply all updates at once
+        self.update(updates)
 
         # Recompute rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
-        self.cos, self.sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
+        self.cos, self.sin = self._precompute_rotary_embeddings(
+            self.rotary_seq_len, head_dim
+        )
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000):
         """Precompute rotary embeddings"""
@@ -257,16 +283,23 @@ class GPT(nn.Module):
         """Return the estimated FLOPs per token for the model"""
         # Count parameters
         params = tree_flatten(self.parameters())
-        nparams = sum(p.size for p in params if isinstance(p, mx.array))
+        nparams = sum(v.size for _, v in params if hasattr(v, "size"))
         nparams_embedding = self.wte.weight.size
 
-        l, h, q, t = self.config.n_layer, self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
+        l, h, q, t = (
+            self.config.n_layer,
+            self.config.n_head,
+            self.config.n_embd // self.config.n_head,
+            self.config.sequence_len,
+        )
         num_flops_per_token = 6 * (nparams - nparams_embedding) + 12 * l * h * q * t
         return num_flops_per_token
 
-    def setup_optimizers(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0):
+    def setup_optimizers(
+        self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0
+    ):
         """Setup optimizers for different parameter groups"""
-        import mlx.optimizers as optim
+        from nanochat.adamw import AdamW
         from nanochat.muon import Muon
 
         model_dim = self.config.n_embd
@@ -274,12 +307,17 @@ class GPT(nn.Module):
 
         # Separate parameters into groups
         matrix_params = []
-        for block in self.h:
-            matrix_params.extend([
-                block.attn.c_q.weight, block.attn.c_k.weight,
-                block.attn.c_v.weight, block.attn.c_proj.weight,
-                block.mlp.c_fc.weight, block.mlp.c_proj.weight
-            ])
+        for block in self.h.layers:
+            matrix_params.extend(
+                [
+                    block.attn.c_q.weight,
+                    block.attn.c_k.weight,
+                    block.attn.c_v.weight,
+                    block.attn.c_proj.weight,
+                    block.mlp.c_fc.weight,
+                    block.mlp.c_proj.weight,
+                ]
+            )
 
         embedding_params = [self.wte.weight]
         lm_head_params = [self.lm_head.weight]
@@ -287,37 +325,41 @@ class GPT(nn.Module):
         # Scale LR by model dimension
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         if rank == 0:
-            print(f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
+            print(
+                f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}"
+            )
 
-        # Create AdamW optimizer for embeddings
-        adamw_optimizer = optim.AdamW(
+        # Create AdamW optimizer for embeddings - use our custom implementation
+        adamw_optimizer = AdamW(
             learning_rate=embedding_lr * dmodel_lr_scale,
             betas=(0.8, 0.95),
             eps=1e-10,
-            weight_decay=weight_decay
+            weight_decay=weight_decay,
         )
 
         # Create Muon optimizer for matrix params
-        muon_optimizer = Muon(
-            learning_rate=matrix_lr,
-            momentum=0.95
-        )
+        muon_optimizer = Muon(learning_rate=matrix_lr, momentum=0.95)
 
-        return [adamw_optimizer, muon_optimizer], [embedding_params + lm_head_params, matrix_params]
+        return [adamw_optimizer, muon_optimizer], [
+            embedding_params + lm_head_params,
+            matrix_params,
+        ]
 
-    def __call__(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def __call__(self, idx, targets=None, kv_cache=None, loss_reduction="mean"):
         B, T = idx.shape
 
         # Get rotary embeddings
-        assert T <= self.cos.shape[1], f"Sequence length {T} exceeds rotary cache {self.cos.shape[1]}"
+        assert T <= self.cos.shape[1], (
+            f"Sequence length {T} exceeds rotary cache {self.cos.shape[1]}"
+        )
 
         T0 = 0 if kv_cache is None else kv_cache.get_pos()
-        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T]
+        cos_sin = self.cos[:, T0 : T0 + T], self.sin[:, T0 : T0 + T]
 
         # Forward through transformer
         x = self.wte(idx)
         x = norm(x)
-        for block in self.h:
+        for block in self.h.layers:
             x = block(x, cos_sin, kv_cache)
         x = norm(x)
 
@@ -332,12 +374,37 @@ class GPT(nn.Module):
             logits_flat = mx.reshape(logits, (-1, logits.shape[-1]))
             targets_flat = mx.reshape(targets, (-1,))
 
-            # Mask out -1 (ignore index)
-            mask = targets_flat != -1
-            logits_masked = logits_flat[mask]
-            targets_masked = targets_flat[mask]
+            # Valid positions (ignore_index = -1)
+            valid = targets_flat >= 0
+            mask = valid.astype(mx.float32)
 
-            loss = nn.losses.cross_entropy(logits_masked, targets_masked, reduction=loss_reduction)
+            # Compute log_softmax for numerical stability
+            logits_max = mx.max(logits_flat, axis=-1, keepdims=True)
+            logits_shifted = logits_flat - logits_max
+            exp_logits = mx.exp(logits_shifted)
+            sum_exp = mx.sum(exp_logits, axis=-1, keepdims=True)
+            log_probs = logits_shifted - mx.log(sum_exp)
+
+            # Gather log-prob for targets with safe indices (0 for invalid)
+            targets_safe = mx.where(valid, targets_flat, mx.zeros_like(targets_flat))
+            target_log_probs = mx.take_along_axis(
+                log_probs,
+                mx.expand_dims(targets_safe, axis=-1),
+                axis=-1,
+            )
+            target_log_probs = mx.squeeze(target_log_probs, axis=-1)
+
+            # Negative log-likelihood masked
+            nll = -target_log_probs * mask
+
+            if loss_reduction == "mean":
+                denom = mx.sum(mask) + 1e-8
+                loss = mx.sum(nll) / denom
+            elif loss_reduction == "sum":
+                loss = mx.sum(nll)
+            else:  # 'none' -> return (B, T)
+                loss = mx.reshape(nll, (B, T))
+
             return loss
         else:
             # Inference mode: return logits
@@ -359,17 +426,25 @@ class GPT(nn.Module):
             logits = logits[:, -1, :]  # (B, vocab_size)
 
             if top_k is not None:
-                # Top-k filtering
-                top_logits, top_indices = mx.topk(logits, min(top_k, logits.shape[-1]))
-                logits = mx.full_like(logits, float('-inf'))
-                logits = mx.scatter(logits, top_indices, top_logits, axis=-1)
-
-            if temperature > 0:
-                logits = logits / temperature
-                probs = mx.softmax(logits, axis=-1)
-                next_ids = mx.random.categorical(probs, num_samples=1)
+                # MLX topk returns indices; gather values explicitly
+                k = min(top_k, logits.shape[-1])
+                top_idx = mx.topk(logits, k, axis=-1)
+                top_vals = mx.take_along_axis(logits, top_idx, axis=-1)
+                # Sample within top-k using logits/temperature
+                if temperature > 0:
+                    top_logits = top_vals / temperature
+                    choice = mx.random.categorical(top_logits, num_samples=1)
+                else:
+                    choice = mx.argmax(top_vals, axis=-1, keepdims=True)
+                next_ids = mx.take_along_axis(top_idx, choice, axis=-1)
             else:
-                next_ids = mx.argmax(logits, axis=-1, keepdims=True)
+                # Sample from full distribution
+                if temperature > 0:
+                    next_ids = mx.random.categorical(
+                        logits / temperature, num_samples=1
+                    )
+                else:
+                    next_ids = mx.argmax(logits, axis=-1, keepdims=True)
 
             ids = mx.concatenate((ids, next_ids), axis=1)
             token = int(next_ids[0, 0])
